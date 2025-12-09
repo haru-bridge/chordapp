@@ -73,21 +73,27 @@ export default function Home() {
 
     await Tone.start();
 
-    // 音割れ対策：リミッター＋まろやかなシンセ
-    const limiter = new Tone.Limiter(-8).toDestination();
+    // マスター側も少しだけ下げておく（音楽的な意味は変わらない）
+    Tone.getDestination().volume.value = -6;
+
+    // 音割れ対策：しきい値を深めにしたリミッター＋かなり小さい音量
+    const limiter = new Tone.Limiter(-16).toDestination();
+
+    // ここが「シンセの音色・ダイナミクス」のみ
     const synth = new Tone.PolySynth(Tone.Synth, {
       oscillator: {
         type: "sine",
       },
       envelope: {
-        attack: 0.01,
-        decay: 0.1,
-        sustain: 0.7,
-        release: 0.3,
+        attack: 0.02, // 少しなめらかにしてピークを削る
+        decay: 0.12,
+        sustain: 0.6,
+        release: 0.4, // 余韻を長めにして「バチッ」と立たないように
       },
     }).connect(limiter);
 
-    synth.volume.value = -10;
+    // モバイル前提でかなり小さめに
+    synth.volume.value = -20;
 
     const secondsPerBeat = 60 / bpm;
     const intervalSec = beatsPerChord * secondsPerBeat;
@@ -102,6 +108,7 @@ export default function Home() {
     });
 
     chords.forEach((ch: ParsedChord, i: number) => {
+      // ★ ここでのノート列は一切いじらない（＝音楽的な正しさはそのまま）
       const notes: string[] = chordToNotes(ch, rootOctave);
       if (notes.length === 0) return;
 
@@ -127,18 +134,22 @@ export default function Home() {
         durationSec: noteDurationSec,
       });
 
-      synth.triggerAttackRelease(notes, noteDurationSec, startTime);
+      // velocity を 0.7〜0.9 に絞ってピークをさらに抑える
+      synth.triggerAttackRelease(notes, noteDurationSec, startTime, 0.8);
     });
 
     setIsPlaying(true);
 
     const totalMs = chords.length * intervalSec * 1000 + 500;
     setTimeout(() => {
+      // 念のため全解放してから破棄
+      synth.releaseAll();
       synth.dispose();
       setIsPlaying(false);
       console.log("=== PLAY END ===");
     }, totalMs);
   };
+
 
   return (
     <main

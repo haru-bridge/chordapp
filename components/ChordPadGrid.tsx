@@ -4,9 +4,8 @@ import React, { useRef, useEffect } from "react";
 import * as Tone from "tone";
 import { ParsedChord, chordToNotes } from "../lib/chordEngine";
 
-
 type ChordPadGridProps = {
-  chords: ParsedChord[]; // parseProgression の結果
+  chords: ParsedChord[];
   rootOctave: number;
 };
 
@@ -17,21 +16,60 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({
   rootOctave,
 }) => {
   const synthRef = useRef<Tone.PolySynth | null>(null);
+  const heldNotesRef = useRef<Record<number, string[]>>({});
+  const isPadHeldRef = useRef<Record<number, boolean>>({});
 
-  // アンマウント時にシンセ破棄
+  /** すべての PAD を強制ストップ */
+  const stopAllPads = () => {
+    isPadHeldRef.current = {};
+    heldNotesRef.current = {};
+
+    const synth = synthRef.current;
+    if (!synth) return;
+
+    // 発音中のすべてのノートを解放
+    synth.releaseAll();
+  };
+
+  // アンマウント & グローバルイベントの登録
   useEffect(() => {
+    const handleGlobalPointerEnd = () => {
+      stopAllPads();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        stopAllPads();
+      }
+    };
+
+    window.addEventListener("pointerup", handleGlobalPointerEnd);
+    window.addEventListener("pointercancel", handleGlobalPointerEnd);
+    window.addEventListener("blur", handleGlobalPointerEnd);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
+      window.removeEventListener("pointerup", handleGlobalPointerEnd);
+      window.removeEventListener("pointercancel", handleGlobalPointerEnd);
+      window.removeEventListener("blur", handleGlobalPointerEnd);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+
       if (synthRef.current) {
+        synthRef.current.releaseAll();
         synthRef.current.dispose();
         synthRef.current = null;
       }
+      heldNotesRef.current = {};
+      isPadHeldRef.current = {};
     };
   }, []);
 
-  async function ensureSynth() {
+  /** Pad 用シンセを lazy に確保 */
+  const ensureSynth = async (): Promise<Tone.PolySynth> => {
     if (!synthRef.current) {
       await Tone.start();
-      const limiter = new Tone.Limiter(-8).toDestination();
+
+      const limiter = new Tone.Limiter(-12).toDestination();
       const synth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: "sine" },
         envelope: {
@@ -41,28 +79,49 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({
           release: 0.2,
         },
       }).connect(limiter);
-      synth.volume.value = -10;
+
+      synth.volume.value = -18; // モバイル向けに小さめ
+
       synthRef.current = synth;
     }
     return synthRef.current;
-  }
-
-  const handlePadDown = async (chord: ParsedChord) => {
-    const synth = await ensureSynth();
-    const notes = chordToNotes(chord, rootOctave);
-    if (notes.length === 0) return;
-    synth.triggerAttack(notes); // 押している間鳴らす
-  };
-
-  const handlePadUp = (chord: ParsedChord) => {
-    const synth = synthRef.current;
-    if (!synth) return;
-    const notes = chordToNotes(chord, rootOctave);
-    if (notes.length === 0) return;
-    synth.triggerRelease(notes);
   };
 
   const pads = chords.slice(0, MAX_PADS);
+
+  /** 実際に PAD を鳴らし始める処理 */
+  const startPad = async (padIndex: number) => {
+    const chord = pads[padIndex];
+    if (!chord) return;
+
+    // 押された印を先につけておく（async 用）
+    isPadHeldRef.current[padIndex] = true;
+
+    const synth = await ensureSynth();
+
+    // Tone.start() 待ちの間に離されていたら中断
+    if (!isPadHeldRef.current[padIndex]) return;
+
+    const notes = chordToNotes(chord, rootOctave);
+    if (!notes.length) return;
+
+    heldNotesRef.current[padIndex] = notes;
+    synth.triggerAttack(notes, undefined, 0.9);
+  };
+
+  /** PAD を止める処理 */
+  const stopPad = (padIndex: number) => {
+    isPadHeldRef.current[padIndex] = false;
+
+    const synth = synthRef.current;
+    if (!synth) return;
+
+    const notes = heldNotesRef.current[padIndex];
+    if (!notes || !notes.length) return;
+
+    synth.triggerRelease(notes);
+    delete heldNotesRef.current[padIndex];
+  };
 
   if (pads.length === 0) {
     return (
@@ -98,24 +157,40 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({
           <button
             key={`${ch.raw}-${idx}`}
             type="button"
-            onMouseDown={() => handlePadDown(ch)}
-            onMouseUp={() => handlePadUp(ch)}
-            onMouseLeave={() => handlePadUp(ch)}
-            onTouchStart={(e) => {
+            onPointerDown={(e: React.PointerEvent<HTMLButtonElement>) => {
               e.preventDefault();
-              handlePadDown(ch);
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                /* ignore */
+              }
+              startPad(idx);
             }}
-            onTouchEnd={(e) => {
+            onPointerUp={(e: React.PointerEvent<HTMLButtonElement>) => {
               e.preventDefault();
-              handlePadUp(ch);
+              try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              } catch {
+                /* ignore */
+              }
+              stopPad(idx);
             }}
-            onTouchCancel={(e) => {
+            onPointerLeave={(e: React.PointerEvent<HTMLButtonElement>) => {
               e.preventDefault();
-              handlePadUp(ch);
+              stopPad(idx);
+            }}
+            onPointerCancel={(e: React.PointerEvent<HTMLButtonElement>) => {
+              e.preventDefault();
+              stopPad(idx);
+            }}
+            // 長押しコンテキストメニューを潰す & 念のためストップ
+            onContextMenu={(e: React.MouseEvent<HTMLButtonElement>) => {
+              e.preventDefault();
+              stopPad(idx);
             }}
             style={{
               borderRadius: 18,
-              border: "1px solid #1f2937",
+              border: "1px solid #262547ff",
               padding: "18px 12px",
               background:
                 "radial-gradient(circle at 30% 30%, #1f2937, #020617 70%)",
@@ -129,8 +204,9 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({
               flexDirection: "column",
               alignItems: "center",
               justifyContent: "center",
-              transition:
-                "transform 0.06s ease-out, box-shadow 0.06s ease-out",
+              transition: "transform 0.06s ease-out, box-shadow 0.06s ease-out",
+              userSelect: "none",
+              touchAction: "manipulation",
             }}
           >
             <span
@@ -159,7 +235,7 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({
           style={{
             marginTop: 6,
             fontSize: 11,
-            color: "#6b7280",
+            color: "#33405fff",
           }}
         >
           ※ 先頭から 9 個までのコードがパッドに割り当てられています。
