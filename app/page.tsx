@@ -2,159 +2,14 @@
 
 import React, { useState, ChangeEvent } from "react";
 import * as Tone from "tone";
-import { Chord } from "tonal";
+import {
+  ParsedChord,
+  parseProgression,
+  chordToNotes,
+} from "../lib/chordEngine";
+import { ChordPadGrid } from "../components/ChordPadGrid";
 
-type ParsedChord = {
-  raw: string;      // 入力そのまま（表示用）
-  symbol: string;   // スラッシュ前の部分
-  bass?: string | null;
-};
 
-/** 文字コード系を Tonal が読める形に揃える */
-function normalizeChordSymbol(symbol: string): string {
-  let s = symbol.trim();
-
-  // 全角スペース削除
-  s = s.replace(/\u3000/g, " ");
-
-  // メジャー7の△記号 → maj
-  // （△ U+25B3, Δ U+0394 両方ケア）
-  s = s.replace(/[△Δ]/g, "maj");
-
-  // ♭ / ♯ を b / #
-  s = s.replace(/♭/g, "b").replace(/♯/g, "#");
-
-  // 全角カッコ → 半角
-  s = s.replace(/（/g, "(").replace(/）/g, ")");
-
-  // Bm7(♭5) → Bm7♭5 → Bm7b5
-  s = s.replace(/\(([^)]+)\)/g, "$1");
-
-  // もう一度フラットを ascii に
-  s = s.replace(/♭/g, "b");
-
-  return s;
-}
-
-/**
- * テキスト（例: "Db Ab/C Bbm7 Gbmaj7"）をパース
- */
-function parseProgression(
-  input: string,
-  options?: { silent?: boolean }
-): ParsedChord[] {
-  const tokens: string[] = input
-    // 空白・カンマ・縦棒・矢印・ハイフンで区切る
-    // 例: "F△7 - B♭7 - Em7" に対応
-    .split(/[\s,|→\-–]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  const result: ParsedChord[] = tokens.map((token: string) => {
-    const [symbol, bass] = token.split("/");
-    return {
-      raw: token,
-      symbol,
-      bass: bass ?? null,
-    };
-  });
-
-  if (!options?.silent) {
-    console.log("parseProgression result:", result);
-  }
-
-  return result;
-}
-
-/**
- * Chord.get の結果から、実際に鳴らすノート配列に変換
- * rootOctave でルートの高さだけ調整できる
- */
-function chordToNotes(parsed: ParsedChord, rootOctave: number): string[] {
-  // ここで F△7 / B♭7 / Bm7(♭5) などを Tonal 用に正規化
-  const normalized = normalizeChordSymbol(parsed.symbol);
-
-  // ローマ数字など、音名で始まらないものはスキップ（(IV) とか）
-  if (!/^[A-G][#b]?/i.test(normalized)) {
-    console.log("skip non-pitch symbol:", parsed.symbol, "=>", normalized);
-    return [];
-  }
-
-  const info = Chord.get(normalized);
-
-  console.log("Chord.get:", {
-    inputSymbol: parsed.symbol,
-    normalizedSymbol: normalized,
-    chordInfo: info,
-  });
-
-  if (!info || info.empty || !info.notes || info.notes.length === 0) {
-    console.warn("解釈できないコード:", parsed.raw, info);
-    return [];
-  }
-
-  // 例: ["F", "A", "C", "E"]
-  const pcs: string[] = info.notes.slice();
-
-  const notes: string[] = [];
-  const midis: number[] = [];
-
-  // 1. ルートを rootOctave に置く
-  const rootPc = pcs[0];
-  const rootNote = `${rootPc}${rootOctave}`;
-  const rootMidi = Tone.Frequency(rootNote).toMidi();
-
-  notes.push(rootNote);
-  midis.push(rootMidi);
-
-  // 2. 残りの構成音は「直前より下がらないように」上に積む
-  for (let i = 1; i < pcs.length; i++) {
-    const pc = pcs[i];
-
-    let octave = rootOctave;
-    let noteName = `${pc}${octave}`;
-    let midi = Tone.Frequency(noteName).toMidi();
-
-    // 直前の音以下ならオクターブを上げていく
-    while (midi <= midis[midis.length - 1]) {
-      octave++;
-      noteName = `${pc}${octave}`;
-      midi = Tone.Frequency(noteName).toMidi();
-    }
-
-    notes.push(noteName);
-    midis.push(midi);
-  }
-
-  // 3. 分数コードがあれば、ベースはルートより下になるまで下げて先頭に追加
-  if (parsed.bass) {
-    let bassOct = rootOctave - 1;
-    let bassName = `${parsed.bass}${bassOct}`;
-    let bassMidi = Tone.Frequency(bassName).toMidi();
-
-    while (bassMidi >= midis[0]) {
-      bassOct--;
-      bassName = `${parsed.bass}${bassOct}`;
-      bassMidi = Tone.Frequency(bassName).toMidi();
-    }
-
-    const bassNote = Tone.Frequency(bassMidi, "midi").toNote();
-    notes.unshift(bassNote);
-    midis.unshift(bassMidi);
-  }
-
-  console.log("chordToNotes (voiced):", {
-    raw: parsed.raw,
-    symbol: parsed.symbol,
-    normalizedSymbol: normalized,
-    bass: parsed.bass,
-    pitchClasses: pcs,
-    notesWithOctave: notes,
-    midis,
-  });
-
-  return notes;
-}
 
 export default function Home() {
   // デフォルトは Cメジャーの丸サ進行
@@ -178,18 +33,24 @@ export default function Home() {
     }
   };
 
-  const handleBeatsChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const v = Number(e.target.value);
-    if (!Number.isNaN(v) && v > 0) {
-      setBeatsPerChord(v);
-    }
+  // 拍数を ±1 する（1〜16 にクランプ）
+  const stepBeats = (delta: number) => {
+    setBeatsPerChord((prev) => {
+      const next = prev + delta;
+      if (next < 1) return 1;
+      if (next > 16) return 16;
+      return next;
+    });
   };
 
-  const handleRootOctaveChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const v = Number(e.target.value);
-    if (!Number.isNaN(v)) {
-      setRootOctave(v);
-    }
+  // ルートオクターブを ±1 する（1〜6 にクランプ）
+  const stepRootOctave = (delta: number) => {
+    setRootOctave((prev) => {
+      const next = prev + delta;
+      if (next < 1) return 1;
+      if (next > 6) return 6;
+      return next;
+    });
   };
 
   const handlePlay = async () => {
@@ -259,6 +120,7 @@ export default function Home() {
         index: i,
         raw: ch.raw,
         symbol: ch.symbol,
+        bass: ch.bass,
         notes,
         noteDetail: detail,
         startTimeRelativeSec: startTime - now,
@@ -284,7 +146,7 @@ export default function Home() {
         minHeight: "100vh",
         margin: 0,
         padding: "40px 16px",
-        background: "#020617", // 背景: ほぼ黒
+        background: "#020617",
         color: "#e5e7eb",
         fontFamily:
           'system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif',
@@ -415,8 +277,7 @@ export default function Home() {
               lineHeight: 1.5,
             }}
           >
-            例（丸サ進行 / Cメジャー）:{" "}
-            <code>Fmaj7 E7 Am7 Dm7 G7</code>
+            例（丸サ進行 / Cメジャー）: <code>Fmaj7 E7 Am7 Dm7 G7</code>
             <br />
             例（Db の進行）: <code>Db Ab/C Bbm7 Gbmaj7</code>
             <br />
@@ -480,7 +341,7 @@ export default function Home() {
               </div>
             </div>
 
-            {/* 拍数 */}
+            {/* 拍数（ステッパー） */}
             <div>
               <label
                 style={{
@@ -491,27 +352,62 @@ export default function Home() {
               >
                 1コードの長さ（拍）
               </label>
-              <input
-                type="number"
-                min={1}
-                max={16}
-                value={beatsPerChord}
-                onChange={handleBeatsChange}
+              <div
                 style={{
                   marginTop: 4,
-                  width: 80,
-                  padding: "4px 6px",
-                  borderRadius: 8,
-                  border: "1px solid #374151",
-                  background: "#020617",
-                  color: "#e5e7eb",
-                  fontSize: 13,
-                  textAlign: "right",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
                 }}
-              />
+              >
+                <button
+                  type="button"
+                  onClick={() => stepBeats(-1)}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 999,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    color: "#e5e7eb",
+                    cursor: "pointer",
+                  }}
+                >
+                  −
+                </button>
+                <span
+                  style={{
+                    minWidth: 32,
+                    textAlign: "center",
+                    padding: "4px 8px",
+                    borderRadius: 8,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    fontVariantNumeric: "tabular-nums",
+                    fontSize: 13,
+                  }}
+                >
+                  {beatsPerChord}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => stepBeats(1)}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 999,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    color: "#e5e7eb",
+                    cursor: "pointer",
+                  }}
+                >
+                  ＋
+                </button>
+              </div>
             </div>
 
-            {/* オクターブ */}
+            {/* オクターブ（ステッパー） */}
             <div>
               <label
                 style={{
@@ -522,28 +418,72 @@ export default function Home() {
               >
                 ルートのオクターブ
               </label>
-              <input
-                type="number"
-                min={1}
-                max={6}
-                value={rootOctave}
-                onChange={handleRootOctaveChange}
+              <div
                 style={{
                   marginTop: 4,
-                  width: 80,
-                  padding: "4px 6px",
-                  borderRadius: 8,
-                  border: "1px solid #374151",
-                  background: "#020617",
-                  color: "#e5e7eb",
-                  fontSize: 13,
-                  textAlign: "right",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
                 }}
-              />
+              >
+                <button
+                  type="button"
+                  onClick={() => stepRootOctave(-1)}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 999,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    color: "#e5e7eb",
+                    cursor: "pointer",
+                  }}
+                >
+                  −
+                </button>
+                <span
+                  style={{
+                    minWidth: 32,
+                    textAlign: "center",
+                    padding: "4px 8px",
+                    borderRadius: 8,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    fontVariantNumeric: "tabular-nums",
+                    fontSize: 13,
+                  }}
+                >
+                  {rootOctave}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => stepRootOctave(1)}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 999,
+                    border: "1px solid #374151",
+                    background: "#020617",
+                    color: "#e5e7eb",
+                    cursor: "pointer",
+                  }}
+                >
+                  ＋
+                </button>
+              </div>
             </div>
           </div>
         </section>
-
+        {/* パッド演奏モード */}
+        <section
+          style={{
+            marginTop: 24,
+            paddingTop: 16,
+            borderTop: "1px solid #111827",
+          }}
+        >
+          <ChordPadGrid chords={previewChords} rootOctave={rootOctave} />
+        </section>
         {/* 再生ボタン */}
         <section
           style={{
