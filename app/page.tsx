@@ -13,15 +13,14 @@ import {
   ParsedItem,
   ParsedChord,
   parseChordInputDetailed,
-  chordToNotes,
 } from "../lib/chordEngine";
+import { voicingForChord } from "../lib/voicingEngine";
 
 import {
   parseRomanInputDetailed,
   itemsToPlayableChords,
 } from "../lib/romanEngine";
 import {
-  
   KeySpec,
   semitoneShift,
   transposeChord,
@@ -49,9 +48,9 @@ const TONICS = [
   "B",
 ] as const;
 type Tonic = (typeof TONICS)[number];
-
 type KeyMode = "major" | "minor";
 
+type VoicingResult = { notes: string[]; midis: number[]; pcs: string[] };
 
 export default function Home() {
   const playSynthRef = useRef<Tone.PolySynth | null>(null);
@@ -59,19 +58,20 @@ export default function Home() {
   const playTimeoutRef = useRef<number | null>(null);
 
   const [inputMode, setInputMode] = useState<InputMode>("chord");
-
   const [input, setInput] = useState<string>("Fmaj7 E7 Am7 Dm7 G7");
+
   const [bpm, setBpm] = useState<number>(90);
   const [beatsPerChord, setBeatsPerChord] = useState<number>(4);
-  const [rootOctave, setRootOctave] = useState<number>(3);
+
+  // 「中心（手の位置）」として扱う
+  const [centerOctave, setCenterOctave] = useState<number>(4);
+
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
 
   const [fromTonic, setFromTonic] = useState<Tonic>("C");
   const [fromMode, setFromMode] = useState<KeyMode>("major");
-
   const [toTonic, setToTonic] = useState<Tonic>("C");
   const [toMode, setToMode] = useState<KeyMode>("major");
-
 
   const fromKey: KeySpec = useMemo(
     () => ({ tonic: fromTonic, mode: fromMode }),
@@ -103,10 +103,8 @@ export default function Home() {
       .filter(Boolean) as ParsedChord[];
   }, [playableOriginal, shift]);
 
-  // 度数表示
   const degrees: string[] = useMemo(() => {
     if (inputMode === "roman") {
-      // roman入力は、degree をそのまま並べる（無ければ raw）
       return parsedItems
         .filter((it) => it.status === "ok" || it.status === "warn")
         .map((it) => it.degree ?? it.raw);
@@ -114,18 +112,53 @@ export default function Home() {
     return playableOriginal.map((ch) => romanDegreeForChord(ch, fromKey));
   }, [inputMode, parsedItems, playableOriginal, fromKey]);
 
-  // PAD用（変換後コードを鳴らす）
+  // voicing 設定（安定させるために useMemo で固定）
+  const voicingOpts = useMemo(
+    () => ({
+      maxVoices: 4,
+      includeBass: true,
+      includeRoot: true,
+      range: { low: 40, high: 84 },
+      anchorWeight: 0.35,
+      maxLeap: 7,
+      leapPenaltyWeight: 0.7,
+    }),
+    []
+  );
+
+  // ここが肝：進行全体の voicing を一回だけ作る（prevはreduceで渡す＝再代入しない）
+  const voicingsOriginal: VoicingResult[] = useMemo(() => {
+    const acc = playableOriginal.reduce(
+      (st, ch) => {
+        const v = voicingForChord(ch, centerOctave, st.prev, voicingOpts);
+        return { prev: v.midis, out: [...st.out, v] };
+      },
+      { prev: null as number[] | null, out: [] as VoicingResult[] }
+    );
+    return acc.out;
+  }, [playableOriginal, centerOctave, voicingOpts]);
+
+  // PADは voicingsOriginal を元にして、最後に shift を足す（ここで chordToNotes は使わない）
   const padItems = useMemo(() => {
-    const pads = playableTransposed.slice(0, MAX_PADS);
-    return pads.map((ch, i) => ({
-      chord: ch,
-      notes: chordToNotes(ch, rootOctave),
-      label:
-        inputMode === "roman"
-          ? degrees[i] ?? formatChordSymbol(ch)
-          : ch.raw ?? formatChordSymbol(ch),
-    }));
-  }, [playableTransposed, rootOctave, inputMode, degrees]);
+    const pads = playableOriginal.slice(0, MAX_PADS);
+
+    return pads.map((origCh, i) => {
+      const transCh = transposeChord(origCh, shift) ?? origCh;
+
+      const baseMidis = voicingsOriginal[i]?.midis ?? [];
+      const midis = baseMidis.map((m) => m + shift);
+      const notes = midis.map((m) => Tone.Frequency(m, "midi").toNote());
+
+      return {
+        chord: transCh,
+        notes,
+        label:
+          inputMode === "roman"
+            ? degrees[i] ?? formatChordSymbol(transCh)
+            : origCh.raw ?? formatChordSymbol(transCh),
+      };
+    });
+  }, [playableOriginal, voicingsOriginal, shift, inputMode, degrees]);
 
   const handleInputChange = (e: ChangeEvent<HTMLTextAreaElement>) =>
     setInput(e.target.value);
@@ -133,10 +166,11 @@ export default function Home() {
     const v = Number(e.target.value);
     if (!Number.isNaN(v)) setBpm(v);
   };
+
   const stepBeats = (delta: number) =>
     setBeatsPerChord((p) => Math.min(16, Math.max(1, p + delta)));
-  const stepRootOctave = (delta: number) =>
-    setRootOctave((p) => Math.min(6, Math.max(1, p + delta)));
+  const stepCenterOctave = (delta: number) =>
+    setCenterOctave((p) => Math.min(6, Math.max(1, p + delta)));
 
   const stopPlayback = () => {
     Tone.Transport.stop();
@@ -179,7 +213,7 @@ export default function Home() {
 
   const handlePlay = async () => {
     if (isPlaying) return;
-    if (playableTransposed.length === 0) return;
+    if (voicingsOriginal.length === 0) return;
 
     stopPlayback();
     await Tone.start();
@@ -191,9 +225,12 @@ export default function Home() {
     const noteDurationSec = intervalSec * 0.9;
     const startAt = Tone.now();
 
-    playableTransposed.forEach((ch, i) => {
-      const notes = chordToNotes(ch, rootOctave);
-      if (!notes.length) return;
+    // 再生も voicingsOriginal を使う（PADと一致）
+    voicingsOriginal.forEach((v, i) => {
+      if (!v.midis.length) return;
+      const midis = v.midis.map((m) => m + shift);
+      const notes = midis.map((m) => Tone.Frequency(m, "midi").toNote());
+
       synth.triggerAttackRelease(
         notes,
         noteDurationSec,
@@ -204,7 +241,7 @@ export default function Home() {
 
     setIsPlaying(true);
 
-    const totalMs = playableTransposed.length * intervalSec * 1000 + 500;
+    const totalMs = voicingsOriginal.length * intervalSec * 1000 + 500;
     playTimeoutRef.current = window.setTimeout(() => stopPlayback(), totalMs);
   };
 
@@ -354,7 +391,6 @@ export default function Home() {
             }
           />
 
-          {/* パース状況（わかりやすく） */}
           <div style={{ marginTop: 8 }}>
             <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>
               解析結果（トークン単位）
@@ -535,7 +571,7 @@ export default function Home() {
             </div>
 
             <div>
-              <div style={labelStyle}>ルートのオクターブ</div>
+              <div style={labelStyle}>中心オクターブ（手の位置）</div>
               <div
                 style={{
                   marginTop: 4,
@@ -546,15 +582,15 @@ export default function Home() {
               >
                 <button
                   type="button"
-                  onClick={() => stepRootOctave(-1)}
+                  onClick={() => stepCenterOctave(-1)}
                   style={btnMiniStyle}
                 >
                   −
                 </button>
-                <span style={badgeStyle}>{rootOctave}</span>
+                <span style={badgeStyle}>{centerOctave}</span>
                 <button
                   type="button"
-                  onClick={() => stepRootOctave(1)}
+                  onClick={() => stepCenterOctave(1)}
                   style={btnMiniStyle}
                 >
                   ＋
@@ -579,7 +615,7 @@ export default function Home() {
         <section style={{ marginTop: 28, display: "flex", gap: 10 }}>
           <button
             onClick={handlePlay}
-            disabled={isPlaying || playableTransposed.length === 0}
+            disabled={isPlaying || voicingsOriginal.length === 0}
             style={{
               padding: "10px 26px",
               fontSize: 15,
@@ -587,16 +623,16 @@ export default function Home() {
               borderRadius: 999,
               border: "none",
               cursor:
-                isPlaying || playableTransposed.length === 0
+                isPlaying || voicingsOriginal.length === 0
                   ? "not-allowed"
                   : "pointer",
               background:
-                isPlaying || playableTransposed.length === 0
+                isPlaying || voicingsOriginal.length === 0
                   ? "#374151"
                   : "linear-gradient(135deg, #22c55e, #16a34a)",
               color: "#0b1120",
               boxShadow:
-                isPlaying || playableTransposed.length === 0
+                isPlaying || voicingsOriginal.length === 0
                   ? "none"
                   : "0 8px 22px rgba(34,197,94,0.35)",
             }}

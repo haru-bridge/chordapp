@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useRef, useEffect } from "react";
+import React, { useRef, useEffect, useCallback } from "react";
 import * as Tone from "tone";
-import { ParsedChord, chordToNotes } from "../lib/chordEngine";
+import { ParsedChord } from "../lib/chordEngine";
 import { NOTES_DEBUG, dlog } from "../lib/debug";
 
 type PadItem = {
@@ -20,35 +20,79 @@ const noteDetail = (n: string) => {
   return { note: n, midi: f.toMidi(), hz: f.toFrequency() };
 };
 
+const isTypingActive = () => {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName.toLowerCase();
+  return (
+    tag === "input" ||
+    tag === "textarea" ||
+    tag === "select" ||
+    el.isContentEditable
+  );
+};
+
+const keyToPadIndex = (e: KeyboardEvent): number | null => {
+  // 1..9 / Numpad1..Numpad9
+  let s: string | null = null;
+  if (e.code.startsWith("Digit")) s = e.code.replace("Digit", "");
+  else if (e.code.startsWith("Numpad")) s = e.code.replace("Numpad", "");
+
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 1 || n > 9) return null;
+  return n - 1;
+};
+
 export const ChordPadGrid: React.FC<ChordPadGridProps> = ({ padItems }) => {
   const synthRef = useRef<Tone.PolySynth | null>(null);
 
-  const heldNotesRef = useRef<Record<number, string[]>>({});
-  const isPadHeldRef = useRef<Record<number, boolean>>({});
+  // padごとに「このpadを何ソースで押してるか」（キーボード＋ポインタ同時押し対策）
+  const padHoldCountsRef = useRef<Record<number, number>>({});
 
+  // padごとに、そのpadが鳴らしている notes（stopで参照）
+  const heldNotesRef = useRef<Record<number, string[]>>({});
+
+  // ポインタ追跡（既存ロジック維持）
   const activePointersRef = useRef<Set<number>>(new Set());
+
+  // noteの参照カウント（複数padで同じ音を鳴らしても破綻しない）
   const noteCountsRef = useRef<Record<string, number>>({});
 
-  const stopAllPads = () => {
-    isPadHeldRef.current = {};
+  // キーボード押下中pad
+  const kbdDownRef = useRef<Set<number>>(new Set());
+
+  const stopAllPads = useCallback(() => {
+    padHoldCountsRef.current = {};
     heldNotesRef.current = {};
     activePointersRef.current = new Set();
     noteCountsRef.current = {};
+    kbdDownRef.current = new Set();
     synthRef.current?.releaseAll();
-  };
+  }, []);
 
   useEffect(() => {
     const handleGlobalPointerUp = (e: PointerEvent) => {
       activePointersRef.current.delete(e.pointerId);
-      if (activePointersRef.current.size === 0) stopAllPads();
+      if (activePointersRef.current.size === 0) {
+        // pointer由来のホールドを全部落とす
+        // （kbdは別に落としたくないので、kbdDownが残ってるpadはstopしない）
+        // ただし現状「padHoldCountsRef」にsource区別は無いので、
+        // pointerが0になった時点で全OFFにするのが一番安全。
+        // ここは既存挙動を維持。
+        stopAllPads();
+      }
     };
+
     const handleGlobalPointerCancel = (e: PointerEvent) => {
       activePointersRef.current.delete(e.pointerId);
       if (activePointersRef.current.size === 0) stopAllPads();
     };
+
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") stopAllPads();
     };
+
     const handleBlur = () => stopAllPads();
 
     window.addEventListener("pointerup", handleGlobalPointerUp);
@@ -68,9 +112,9 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({ padItems }) => {
         synthRef.current = null;
       }
     };
-  }, []);
+  }, [stopAllPads]);
 
-  const initSynth = async () => {
+  const initSynth = useCallback(async () => {
     if (synthRef.current) return synthRef.current;
 
     await Tone.start();
@@ -84,54 +128,69 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({ padItems }) => {
     synth.volume.value = -18;
     synthRef.current = synth;
     return synth;
-  };
+  }, []);
 
-  const getSynthSync = () => synthRef.current;
+  const startPad = useCallback(
+    async (padIndex: number) => {
+      const item = padItems[padIndex];
+      if (!item) return;
 
-  const startPad = async (padIndex: number) => {
-    const item = padItems[padIndex];
-    if (!item) return;
+      const notes = item.notes ?? [];
+      if (!notes.length) return;
 
-    isPadHeldRef.current[padIndex] = true;
+      const cur = padHoldCountsRef.current[padIndex] ?? 0;
+      padHoldCountsRef.current[padIndex] = cur + 1;
 
-    const notes = item.notes;
-    if (!notes.length) return;
+      // 既に同じpadをどこかで押しているなら、追加で鳴らさない
+      if (cur >= 1) return;
 
-    if (NOTES_DEBUG) {
-      dlog("[PAD ON]", {
-        pad: padIndex + 1,
-        chord: item.chord,
-        notes,
-        detail: notes.map(noteDetail),
-      });
-    }
+      if (NOTES_DEBUG) {
+        dlog("[PAD ON]", {
+          pad: padIndex + 1,
+          chord: item.chord,
+          notes,
+          detail: notes.map(noteDetail),
+        });
+      }
 
-    const synthSync = getSynthSync();
-    if (synthSync) {
+      // synthがすでにあるなら同期で鳴らす（初回のawaitを避ける）
+      if (synthRef.current) {
+        heldNotesRef.current[padIndex] = notes;
+
+        for (const n of notes) {
+          const next = (noteCountsRef.current[n] ?? 0) + 1;
+          noteCountsRef.current[n] = next;
+          if (next === 1) synthRef.current.triggerAttack(n, undefined, 0.9);
+        }
+        return;
+      }
+
+      const synth = await initSynth();
+
+      // init中にstopされていたら何もしない
+      if ((padHoldCountsRef.current[padIndex] ?? 0) <= 0) return;
+
       heldNotesRef.current[padIndex] = notes;
 
       for (const n of notes) {
         const next = (noteCountsRef.current[n] ?? 0) + 1;
         noteCountsRef.current[n] = next;
-        if (next === 1) synthSync.triggerAttack(n, undefined, 0.9);
+        if (next === 1) synth.triggerAttack(n, undefined, 0.9);
       }
+    },
+    [padItems, initSynth]
+  );
+
+  const stopPad = useCallback((padIndex: number) => {
+    const cur = padHoldCountsRef.current[padIndex] ?? 0;
+    const nextHold = cur - 1;
+
+    if (nextHold > 0) {
+      padHoldCountsRef.current[padIndex] = nextHold;
       return;
     }
 
-    const synth = await initSynth();
-    if (!isPadHeldRef.current[padIndex]) return;
-
-    heldNotesRef.current[padIndex] = notes;
-
-    for (const n of notes) {
-      const next = (noteCountsRef.current[n] ?? 0) + 1;
-      noteCountsRef.current[n] = next;
-      if (next === 1) synth.triggerAttack(n, undefined, 0.9);
-    }
-  };
-
-  const stopPad = (padIndex: number) => {
-    isPadHeldRef.current[padIndex] = false;
+    delete padHoldCountsRef.current[padIndex];
 
     const synth = synthRef.current;
     if (!synth) return;
@@ -154,7 +213,46 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({ padItems }) => {
     }
 
     delete heldNotesRef.current[padIndex];
-  };
+  }, []);
+
+  // 追加：キーボード 1-9 / Numpad1-9 で pad を鳴らす
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (isTypingActive()) return;
+
+      const idx = keyToPadIndex(e);
+      if (idx === null) return;
+      if (idx < 0 || idx >= padItems.length) return;
+
+      e.preventDefault();
+
+      if (kbdDownRef.current.has(idx)) return;
+      kbdDownRef.current.add(idx);
+      startPad(idx);
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (isTypingActive()) return;
+
+      const idx = keyToPadIndex(e);
+      if (idx === null) return;
+
+      e.preventDefault();
+
+      if (!kbdDownRef.current.has(idx)) return;
+      kbdDownRef.current.delete(idx);
+      stopPad(idx);
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [padItems.length, startPad, stopPad]);
 
   if (padItems.length === 0) {
     return (
@@ -178,7 +276,7 @@ export const ChordPadGrid: React.FC<ChordPadGridProps> = ({ padItems }) => {
             パッド演奏モード
           </h2>
           <p style={{ fontSize: 11, color: "#6b7280", marginBottom: 8 }}>
-            複数同時押し対応。初回のみ音声初期化でわずかに遅れます。
+            複数同時押し対応。キーボード「1〜9」でも鳴らせます。
           </p>
         </div>
 
